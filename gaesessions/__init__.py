@@ -7,11 +7,14 @@ import hmac
 import logging
 import pickle
 import os
-import threading
 import time
 
 from google.appengine.api import memcache
 from google.appengine.ext import db
+
+import logging
+
+SECRET_KEY = "This key must be changed - This key must be changed"
 
 # Configurable cookie options
 COOKIE_NAME_PREFIX = "DgU"  # identifies a cookie as being one used by gae-sessions (so you can set cookies too)
@@ -29,9 +32,6 @@ COOKIE_FMT_SECURE = COOKIE_FMT + '; Secure'
 COOKIE_DATE_FMT = '%a, %d-%b-%Y %H:%M:%S GMT'
 COOKIE_OVERHEAD = len(COOKIE_FMT % (0, '', '')) + len('expires=Xxx, xx XXX XXXX XX:XX:XX GMT; ') + 150  # 150=safety margin (e.g., in case browser uses 4000 instead of 4096)
 MAX_DATA_PER_COOKIE = MAX_COOKIE_LEN - COOKIE_OVERHEAD
-
-_tls = threading.local()
-
 
 def get_current_session():
     """Returns the session associated with the current request."""
@@ -459,18 +459,19 @@ class SessionMiddleware(object):
 
     def __call__(self, environ, start_response):
         # initialize a session for the current user
-        _tls.current_session = Session(lifetime=self.lifetime, no_datastore=self.no_datastore, cookie_only_threshold=self.cookie_only_thresh, cookie_key=self.cookie_key)
+        _current_session = Session(lifetime=self.lifetime, no_datastore=self.no_datastore, cookie_only_threshold=self.cookie_only_thresh, cookie_key=self.cookie_key)
 
         # create a hook for us to insert a cookie into the response headers
-        def my_start_response(status, headers, exc_info=None):
-            _tls.current_session.save()  # store the session if it was changed
-            for ch in _tls.current_session.make_cookie_headers():
+        def my_start_response(current_session, status, headers, exc_info=None):
+            
+            current_session.save() # store the session if it was changed
+            for ch in current_session.make_cookie_headers():
                 headers.append(('Set-Cookie', ch))
+                    
             return start_response(status, headers, exc_info)
 
         # let the app do its thing
-        return self.app(environ, my_start_response)
-
+        return (_current_session, self.app(environ, my_start_response))
 
 class DjangoSessionMiddleware(object):
     """Django middleware that adds session support.  You must specify the
@@ -479,26 +480,27 @@ class DjangoSessionMiddleware(object):
     initialization method with parameters.
     """
     def __init__(self):
-        fake_app = lambda environ, start_response: start_response
-        self.wrapped_wsgi_middleware = SessionMiddleware(fake_app, cookie_key='you MUST change this')
-        self.response_handler = None
+        fake_app = lambda environ, start_response : start_response
+        self.wrapped_wsgi_middleware = SessionMiddleware(fake_app, cookie_key=SECRET_KEY)
 
     def process_request(self, request):
-        self.response_handler = self.wrapped_wsgi_middleware(None, lambda status, headers, exc_info: headers)
-        request.session = get_current_session()  # for convenience
-
+        (request.session, request.response_handler) = self.wrapped_wsgi_middleware(None, lambda status, headers, exc_info : headers)
+        
+        
     def process_response(self, request, response):
-        if self.response_handler:
-            session_headers = self.response_handler(None, [], None)
-            for k, v in session_headers:
+           
+        if hasattr(request, 'response_handler'): # if it has response_handler defined, by construction it also has the session
+            session_headers = request.response_handler(request.session, None, [], None)
+            for k,v in session_headers:
                 response[k] = v
-            self.response_handler = None
+            request.response_handler = None
         if hasattr(request, 'session') and request.session.is_accessed():
             from django.utils.cache import patch_vary_headers
             logging.info("Varying")
             patch_vary_headers(response, ('Cookie',))
+                
         return response
-
+        
 
 def delete_expired_sessions():
     """Deletes expired sessions from the datastore.
@@ -513,3 +515,25 @@ def delete_expired_sessions():
     db.delete(results)
     logging.info('gae-sessions: deleted %d expired sessions from the datastore' % len(results))
     return len(results) < 500
+
+
+def cleanup_sessions(request):
+    
+    # wrapper for delete_expired_sessions that calls it multiple times if additional sessions need to be
+    # removed.  (You must add the appropriate URL to urls.py as well as to the taskqueue.add function call
+    # below for this to work correctly).
+
+    try:
+        num_cleaned_up = delete_expired_sessions()           
+        msg = "gae-sessions:cleanup_sessions(): deleted %d expired sessions from the datastore" % num_cleaned_up
+        logging.info(msg)
+        if num_cleaned_up >= 500:
+            # re-schedule to cleanup remaining sessions immideately, since we didn't get them all in the previous cleanup
+            logging.warning("Re-launching session cleanup since we did not get all in the previous")
+            time.sleep(1.0) # just in case it takes a few milliseconds for the DB to get updated
+            taskqueue.add(queue_name = 'cleanup-sessions-queue', url='Define the URL that you wish to use for this function')
+            
+        return http.HttpResponse("OK")
+    except:
+        logging.critical("Error in cleanup_sessions")
+        return http.HttpResponse("Fail")   
